@@ -120,7 +120,7 @@ SELECT * FROM {table_name}
 		file_path = f"/data/csv/{table_name}.csv"
 		os.makedirs(os.path.dirname(file_path), exist_ok=True)
 		df.to_csv(file_path, mode='w', header=True, index=False)
-		log(f"Saved to '{file_path}")
+		log(f"Saved to '{file_path}'")
 
 	except Exception as e:
 		log(f"Unexpected Exception!")
@@ -160,7 +160,7 @@ ORDER BY RDB$DB_KEY
 				first_write = False
 			else:
 				df.to_csv(file_path, mode='a', header=False, index=False)
-			log(f"Saved to '{file_path}")
+			log(f"Saved to '{file_path}'")
 
 			# If we fetched no rows (empty table, row count is exact multiple
 			# of chunk_size, ...), we're done
@@ -199,6 +199,9 @@ def main():
 
 	# Attempts connection
 	con = get_connection(PATH)
+
+	# Get metadata -- every column from every table
+	export_table_to_csv(con, "RDB$RELATION_FIELDS")
 
 	# Gets all available tables in the Database
 	# [Ref] https://ib-aid.com/download/docs/firebird-language-reference-2.5/fblangref-appx04-relations.html
