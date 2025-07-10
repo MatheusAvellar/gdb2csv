@@ -192,13 +192,16 @@ def main():
 
 	USER = os.environ.get("FB_USER", "SYSDBA")
 	PASS = os.environ.get("FB_PASSWORD", "masterkey")
+	# Charset: WIN1252, ISO8859_1, UTF8, ...; see:
+	# https://github.com/nakagami/pyfirebirdsql/blob/59812c2c731bf0f364bc1ab33a46755bc206c05a/firebirdsql/consts.py#L484
+	# (and https://github.com/nakagami/pyfirebirdsql/commit/5027483b518706c61ab2a1c05c2512e5c03e0a6a)
 	CHAR = os.environ.get("FB_CHARSET", "WIN1252")
 
 	TABLE_LIST = os.environ.get("TABLE_LIST", "all")
 	NO_CHUNKS = os.environ.get("NO_CHUNKS") is not None
 
 	# Attempts connection
-	con = get_connection(PATH)
+	con = get_connection(PATH, user=USER, password=PASS, charset=CHAR)
 
 	# Get metadata -- every column from every table
 	export_table_to_csv(con, "RDB$RELATION_FIELDS")

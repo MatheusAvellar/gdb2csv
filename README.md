@@ -55,6 +55,10 @@ Note: you do not need to rebuild the Docker image if/when you edit the
 `convert.py` file. The `data/` directory is shared as a volume with the Docker
 image, so modifications from either you or the image are seen by both.
 
+### Troubleshooting
+
+* `UnicodeDecodeError()`? Try passing a different charset to the `FB_CHARSET` environment variable. By default, it's [Windows-1252](https://en.wikipedia.org/wiki/Windows-1252) (`WIN1252`), but I've had to change it to [Latin 1/ISO-8859-1](https://en.wikipedia.org/wiki/ISO/IEC_8859-1) (`ISO8859_1`) to get it to work at one point. You can see a full list of options [here](https://github.com/nakagami/pyfirebirdsql/blob/59812c2c731bf0f364bc1ab33a46755bc206c05a/firebirdsql/consts.py#L484).
+
 
 ## This sucks
 Yeah. I hate that 9 out of 10 solutions out there, including this one, require running a local instance of a decades-old Firebird client. I don't believe anything prevents someone from writing a proper table extractor that uses only the file itself – all the data's in there already!! But alas, no one's paying *me* to do it, so it won't be me. I've seen one (1) extractor that works like that, but it failed to extract most of the data, and the CSVs came with a bunch of empty fields. Perhaps built for a different version of Firebird...
