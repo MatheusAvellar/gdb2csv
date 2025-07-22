@@ -42,18 +42,30 @@ docker run --rm \
   gdb2csv
 ```
 
-If that's too much to remember, there's a convenient `./run.sh` you can run that
-does that. Remember to edit in your file and table names!
+If that's too much to remember, there's a convenient `./run.sh` you can run that does that. Remember to edit in your file and table names!
 
-This will execute the `data/convert.py` file, and should output the listed tables as CSVs inside the `data/` directory. The environment variable `TABLE_LIST` receives a list of semicolon (`;`) separated table names to export.
+This will execute the `data/convert.py` file, and should output the listed tables as CSVs inside the `data/` directory.
 
-Alternatively, you can use `TABLE_LIST=all` to convert every table found in the database to CSVs.
+Note that you do not need to rebuild the Docker image if/when you edit the `convert.py` file. The `data/` directory is shared as a volume with the Docker image, so modifications from either you or the image are seen by both.
 
-By default, the script will export the tables in chunks of 10,000 rows – this is to prevent attempting to load the results of tables with hundreds of thousands of rows into memory with `SELECT *`. If, for any reason, you do not want a chunked export, set the environment variable `NO_CHUNKS`. I didn't really test it, but it should work :)
+#### Specify tables
+The environment variable `TABLE_LIST` receives a list of semicolon (`;`) separated table names to export. Alternatively, you can use `TABLE_LIST=all` to convert every table found in the database to CSVs.
 
-Note: you do not need to rebuild the Docker image if/when you edit the
-`convert.py` file. The `data/` directory is shared as a volume with the Docker
-image, so modifications from either you or the image are seen by both.
+#### Exporting large tables
+By default, the script will export the tables in chunks of 10,000 rows – this is to prevent attempting to load the results of tables with millions of rows into memory with `SELECT *`. If, for any reason, you do not want a chunked export, set the environment variable `NO_CHUNKS`. I didn't really test it, but it should work :)
+
+If, when doing a chunked export of a very large table, you need to stop the script for some reason, then:
+* Avoid stopping it during an "Obtaining results..." hang;
+* Take note of the point at which it stopped, and the table being extracted. So, for example, when stopping here:
+	```text
+	2000-00-00 00:00:00| Running query:
+
+	SELECT FIRST 10000 SKIP 150000 *
+	...
+	```
+	You would write down the value `150000`, and the corresponding table name;
+* When coming back to continue exporting, add the following environment variable to your `docker run` command: `-e CONTINUE="150000"`
+* Don't forget to specify the list of tables, in case you had it set to "all". The script will skip the first `CONTINUE` rows in the **first table** to be extracted, so make sure your `TABLE_LIST` starts with whatever one you stopped exporting midway.
 
 ### Troubleshooting
 

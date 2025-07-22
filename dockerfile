@@ -68,10 +68,6 @@ RUN tar -zxvf FirebirdSS-1.5.6.5026-0.nptl.i686.tar.gz && \
 # Add to PATH; I don't know if we need this but I don't wanna test it I'm lazy
 ENV PATH="/opt/firebird:/opt/firebird/bin:/opt/firebird/lib:$PATH"
 
-# `firebird start` seemingly doesn't do anything; when we start the image, the
-# service isn't running. So we just call `start` through Python itself
-#RUN /etc/init.d/firebird start
-
 ################################################################################
 
 # Create /data directory to mirror our real-life one
@@ -87,4 +83,5 @@ ENV FB_CHARSET=WIN1252
 ENV PYTHONIOENCODING=utf8
 
 # Set the default command to run when the container starts
+# Since we haven't called `firebird start`, we'll need to do it through Python
 CMD ["python3", "/data/export.py"]

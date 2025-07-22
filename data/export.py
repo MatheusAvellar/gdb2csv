@@ -62,35 +62,13 @@ def execute_query(con, query):
 	try:
 		cur = con.cursor()
 		log(f"Running query:\n{query}")
-		cur.execute(query)
 
-		log("Obtaining results...")
 		START_TIME = time.time()
+		cur.execute(query)
+		log("Obtaining results...")
 		rows = cur.fetchall()
 		TOTAL_TIME = time.time() - START_TIME
-		log(f"Took {TOTAL_TIME:.1f}s")
 
-		columns = [ desc[0] for desc in cur.description ]
-		return (rows, columns)
-
-	except Exception as e:
-		log(f"Unexpected Exception!")
-		log(repr(e))
-		cur.close()
-		con.close()
-		exit(1)
-
-
-def execute_query(con, query):
-	try:
-		cur = con.cursor()
-		log(f"Running query:\n{query}")
-		cur.execute(query)
-
-		log("Obtaining results...")
-		START_TIME = time.time()
-		rows = cur.fetchall()
-		TOTAL_TIME = time.time() - START_TIME
 		log(f"Took {TOTAL_TIME:.1f}s")
 
 		columns = [ desc[0] for desc in cur.description ]
@@ -129,13 +107,23 @@ SELECT * FROM {table_name}
 		exit(1)
 
 
-def export_table_to_csv_chunked(con, table_name, chunk_size):
+def export_table_to_csv_chunked(con, table_name, chunk_size, cont=0):
 	log(f"Reading table '{table_name}' in chunks of {chunk_size} rows")
 
-	offset = 0
+	cont = int(cont) or 0
+	offset = cont
 	first_write = True
+	table_size = None
 	while True:
 		try:
+			if first_write:
+				(rows, _) = execute_query(con, f"""
+SELECT COUNT(*) FROM {table_name}
+				""")
+				# `rows` is [  ( table_size, )  ]
+				table_size = rows[0][0]
+				log(f"Table has {table_size} row(s)")
+
 			# Get chunked results via FIRST N SKIP M syntax using RDB$DB_KEY as a
 			# unique representation of each table record
 			# [Ref FIRST/SKIP] https://www.firebirdsql.org/refdocs/langrefupd20-select.html#langrefupd20-first-skip
@@ -150,17 +138,26 @@ ORDER BY RDB$DB_KEY
 			# We could manually write the CSV but we can just use Pandas instead
 			df = pd.DataFrame(rows, columns=columns)
 			row_count = len(df)
-			log(f"Fetched {row_count} rows")
+			total_so_far = row_count + offset
+			if table_size:
+				pct = round((total_so_far/table_size)*100_00)/1_00
+				log(f"Fetched {row_count} rows -- ({pct}%) {total_so_far} read of {table_size} total")
+			else:
+				log(f"Fetched {row_count} rows -- {total_so_far} read")
 
+			# If we've already created the file previously
+			if first_write and cont > 0:
+				first_write = False
 			file_path = f"/data/csv/{table_name}.csv"
 			if first_write:
 				# Guarantees /csv directory exists
 				os.makedirs(os.path.dirname(file_path), exist_ok=True)
 				df.to_csv(file_path, mode='w', header=True, index=False)
 				first_write = False
+				log(f"Saved to '{file_path}'")
 			else:
 				df.to_csv(file_path, mode='a', header=False, index=False)
-			log(f"Saved to '{file_path}'")
+				log(f"Appended to '{file_path}'")
 
 			# If we fetched no rows (empty table, row count is exact multiple
 			# of chunk_size, ...), we're done
@@ -199,6 +196,7 @@ def main():
 
 	TABLE_LIST = os.environ.get("TABLE_LIST", "all")
 	NO_CHUNKS = os.environ.get("NO_CHUNKS") is not None
+	CONTINUE = int(os.environ.get("CONTINUE", 0))
 
 	# Attempts connection
 	con = get_connection(PATH, user=USER, password=PASS, charset=CHAR)
@@ -215,12 +213,15 @@ WHERE RDB$SYSTEM_FLAG = 0 AND RDB$VIEW_BLR IS NULL
 ORDER BY RDB$RELATION_NAME
 	""")
 
+	found_tables = [ row[0] for row in found_tables ]
+	print(f"Found {len(found_tables)} table(s):\n" + ", ".join(found_tables))
+
 	wanted_tables = None
 	tables_that_exist = None
 	# If user wants ALL tables
 	if TABLE_LIST.lower() == "all":
 		# WE GET THEM ALL
-		wanted_tables = [ row[0] for row in found_tables ]
+		wanted_tables = found_tables
 		tables_that_exist = wanted_tables
 	# Otherwise
 	else:
@@ -228,8 +229,7 @@ ORDER BY RDB$RELATION_NAME
 		wanted_tables = [ t.strip() for t in TABLE_LIST.split(";") ]
 		tables_that_exist = []
 		# For every table we found on the database
-		for table_tuple in found_tables:
-			table_name = table_tuple[0]
+		for table_name in found_tables:
 			# If this is a table we want
 			if table_name in wanted_tables:
 				# Save it
@@ -247,7 +247,14 @@ ORDER BY RDB$RELATION_NAME
 			export_table_to_csv(con, table)
 		# Otherwise, we do the more labor-intensive process of chunking the results
 		else:
-			export_table_to_csv_chunked(con, table, CHUNK_SIZE)
+			# For the first table, we might want to continue a previous extraction
+			if i == 0:
+				if CONTINUE > 0:
+					log(f"Continuing previous extraction; skipping {CONTINUE} rows")
+				export_table_to_csv_chunked(con, table, CHUNK_SIZE, cont=CONTINUE)
+			# For the rest of them, start from scratch
+			else:
+				export_table_to_csv_chunked(con, table, CHUNK_SIZE)
 
 		log(f"Done with {table}!\n")
 		log("-"*10)
