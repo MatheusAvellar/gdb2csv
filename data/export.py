@@ -21,7 +21,7 @@ def split_array_chunks(data: list, chunk_size: int) -> list:
 	return output
 
 
-def get_connection(db_path, user="SYSDBA", password="masterkey", charset="WIN1252"):
+def get_connection(db_path: str, user: str="SYSDBA", password: str="masterkey", charset: str="WIN1252"):
 	con = None
 	# Sometimes we can't connect the first or second times we try,
 	# so let's loop it and limit our attempts
@@ -31,7 +31,7 @@ def get_connection(db_path, user="SYSDBA", password="masterkey", charset="WIN125
 	while not success:
 		# If we've tried too many times, then give up :\
 		if attempt > MAX_ATTEMPTS:
-			log("Conection to Firebird failed :(")
+			log("Connection to Firebird failed :(")
 			exit(1)
 		# Make sure Firebird is running. This command might be run multiple times
 		# but it doesn't error out, so it's fine
@@ -49,7 +49,7 @@ def get_connection(db_path, user="SYSDBA", password="masterkey", charset="WIN125
 				password=password,
 				charset=charset
 			)
-			log("Conected!")
+			log("Connected!")
 			success = True
 		except firebirdsql.OperationalError as e:
 			# Uh oh, we couldn't connect. Don't fret, this happens. We just gotta try
@@ -86,26 +86,71 @@ def execute_query(con, query):
 		raise e
 
 
-def export_table_to_csv(con, table_name: str, max_cols: int = 1_000):
+def probe_table(
+	table_name: str,
+	chunk_size: int,
+	db_path: str,
+	user: str="SYSDBA",
+	password: str="masterkey",
+	charset: str="WIN1252"
+):
+	con = get_connection(db_path, user=user, password=password, charset=charset)
+	# List columns of table
+	(rows, _) = execute_query(con, f"""
+SELECT RDB$FIELD_NAME
+FROM RDB$RELATION_FIELDS
+WHERE RDB$RELATION_NAME = '{table_name}'
+	""")
+	columns = [ row[0] for row in rows ]
+
+	good_cols = []
+	bad_cols = []
+	log(f"Testing each of the table's {len(columns)} column(s)")
+	for column in columns:
+		try:
+			(rows, _) = execute_query(con, f"""
+SELECT FIRST {chunk_size} {column}
+FROM {table_name}
+ORDER BY RDB$DB_KEY
+			""")
+			# If we got here, then this column didn't error out;
+			# add it to good columns list
+			good_cols.append(column)
+		except Exception as ex:
+			log(f"{repr(ex)}; bad column")
+			# Uh oh, we got a bad column! Add it to the list
+			bad_cols.append(column)
+			# Re-obtain connection in case we lost it
+			con = get_connection(db_path, user=user, password=password, charset=charset)
+
+	log(f"Found {len(good_cols)} GOOD column(s) and {len(bad_cols)} BAD column(s)")
+	log(f"BAD column(s): {bad_cols}")
+	return (good_cols, bad_cols)
+
+
+def export_table_to_csv(con, table_name: str, max_cols: int = 1_000, columns: list = None):
 	log(f"Reading entire table '{table_name}'")
 
 	table_columns = []
 	try:
-		# Here we select what columns will be exported at what time
-		# See `export_table_to_csv_chunked()` for an explanation
-		(rows, _) = execute_query(con, f"""
-SELECT RDB$FIELD_NAME
-FROM RDB$RELATION_FIELDS
-WHERE RDB$RELATION_NAME = '{table_name}'
-		""")
-		rows = [ row[0] for row in rows ]
-		column_count = len(rows)
-		log(f"Table has {column_count} column(s)")
+		if not columns:
+			# Here we select what columns will be exported at what time
+			# See `export_table_to_csv_chunked()` for an explanation
+			(rows, _) = execute_query(con, f"""
+	SELECT RDB$FIELD_NAME
+	FROM RDB$RELATION_FIELDS
+	WHERE RDB$RELATION_NAME = '{table_name}'
+			""")
+			rows = [ row[0] for row in rows ]
+			column_count = len(rows)
+			log(f"Table has {column_count} column(s)")
 
-		if len(rows) > max_cols:
-			table_columns = split_array_chunks(rows, max_cols)
+			if len(rows) > max_cols:
+				table_columns = split_array_chunks(rows, max_cols)
+			else:
+				table_columns = [ rows ]
 		else:
-			table_columns = [ rows ]
+			table_columns = [ columns ]
 
 		for i, column_group in enumerate(table_columns):
 			log(f"Attempting to export {len(column_group)} column(s)")
@@ -136,7 +181,14 @@ SELECT {select_columns} FROM {table_name}
 		return False
 
 
-def export_table_to_csv_chunked(con, table_name: str, chunk_size: int, cont: int = 0, max_cols: int = 1_000):
+def export_table_to_csv_chunked(
+	con,
+	table_name: str,
+	chunk_size: int,
+	cont: int = 0,
+	max_cols: int = 1_000,
+	columns: list = None
+):
 	log(f"Reading table '{table_name}' in chunks of {chunk_size} rows")
 	cont = max(0, int(cont or 0))
 	offset = cont
@@ -153,26 +205,29 @@ def export_table_to_csv_chunked(con, table_name: str, chunk_size: int, cont: int
 		main_loop_it += 1
 		try:
 			if main_loop_it == 0:
-				# Sometimes we get 'OperationalError("Can not recv() packets")'
-				# It seems as if that happens when the table has over ~45 columns
-				# So, here, we first check how many columns the table has
-				(rows, _) = execute_query(con, f"""
-SELECT RDB$FIELD_NAME
-FROM RDB$RELATION_FIELDS
-WHERE RDB$RELATION_NAME = '{table_name}'
-				""")
-				# `rows` here is [  ( col name, ), ( col name, ), ...  ]
-				rows = [ row[0] for row in rows ]  # becomes [ col name, col name, ... ]
-				column_count = len(rows)
-				log(f"Table has {column_count} column(s)")
+				if not columns:
+					# Sometimes we get 'OperationalError("Can not recv() packets")'
+					# It seems as if that happens when the table has over ~45 columns
+					# So, here, we first check how many columns the table has
+					(rows, _) = execute_query(con, f"""
+	SELECT RDB$FIELD_NAME
+	FROM RDB$RELATION_FIELDS
+	WHERE RDB$RELATION_NAME = '{table_name}'
+					""")
+					# `rows` here is [  ( col name, ), ( col name, ), ...  ]
+					rows = [ row[0] for row in rows ]  # becomes [ col name, col name, ... ]
+					column_count = len(rows)
+					log(f"Table has {column_count} column(s)")
 
-				# If we're over the maximum column count
-				if len(rows) > max_cols:
-					# Split columns into groups of at most limit size
-					table_columns = split_array_chunks(rows, max_cols)
+					# If we're over the maximum column count
+					if len(rows) > max_cols:
+						# Split columns into groups of at most limit size
+						table_columns = split_array_chunks(rows, max_cols)
+					else:
+						# Otherwise, pick all columns
+						table_columns = [ rows ]
 				else:
-					# Otherwise, pick all columns
-					table_columns = [ rows ]
+					table_columns = [ columns ]
 
 				# Get table row count
 				(rows, _) = execute_query(con, f"""
@@ -312,6 +367,7 @@ ORDER BY RDB$RELATION_NAME
 
 	status = True
 	failed_tables = []
+	failed_columns = []
 	# For every table that exists
 	for i, table in enumerate(tables_that_exist):
 		log(f"Reading table {i+1}/{len(tables_that_exist)}")
@@ -332,19 +388,33 @@ ORDER BY RDB$RELATION_NAME
 
 		# If Firebird crashed during export
 		if not status:
-			# Mark table as failed
+			log("Firebird crashed during export. Probing table columns...")
+			# We try exporting 1 row of each column to discover which are broken
+			good_cols, bad_cols = probe_table(table, CHUNK_SIZE, PATH, user=USER, password=PASS, charset=CHAR)
+			# Save failed table columns as failed
 			failed_tables.append(table)
-			# Open new connection
+			failed_columns.append("|".join(bad_cols))
+			# Get new connection
 			con = get_connection(PATH, user=USER, password=PASS, charset=CHAR)
+			# Export only non-broken columns
+			if NO_CHUNKS:
+				status = export_table_to_csv(con, table, columns=good_cols)
+			else:
+				status = export_table_to_csv_chunked(con, table, CHUNK_SIZE, columns=good_cols)
+			if not status:
+				# FIXME: it's possible CHUNK_SIZE wasn't enough to find the issue with the column
+				# ideally we'd skip only the rows which are problematic, but that might take ages...
+				log("Oops :(  skipping table")
+
 		log(f"Done with {table}!\n")
 		log("-"*10)
 
 	if len(failed_tables) > 0:
-		log("Some tables were not exported. Saving names to _FAILED_TABLES.csv")
+		log("Some table columns were not exported. Saving names to _FAILED_TABLES.csv")
 		file_path = f"/data/csv/_FAILED_TABLES.csv"
 		# Guarantees /csv directory exists
 		os.makedirs(os.path.dirname(file_path), exist_ok=True)
-		df = pd.DataFrame.from_dict({ "failed_table": failed_tables })
+		df = pd.DataFrame.from_dict({ "failed_table": failed_tables, "failed_columns": failed_columns })
 		df.to_csv(file_path, mode='w', header=True, index=False)
 
 	con.close()
