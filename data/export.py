@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 import os
+import shutil
 import subprocess
 import time
-import sys
 import datetime
 
 import firebirdsql
@@ -12,6 +12,13 @@ import pandas as pd
 def log(msg):
 	current_time = datetime.datetime.now().replace(tzinfo=None)
 	print(f"{current_time}| {msg}", flush=True)
+
+
+def split_array_chunks(data: list, chunk_size: int) -> list:
+	output = []
+	for i in range(0, len(data), chunk_size):
+		output.append(data[i:i + chunk_size])
+	return output
 
 
 def get_connection(db_path, user="SYSDBA", password="masterkey", charset="WIN1252"):
@@ -74,49 +81,100 @@ def execute_query(con, query):
 		columns = [ desc[0] for desc in cur.description ]
 		return (rows, columns)
 
+	# Propagate error back to export_table.. function
 	except Exception as e:
-		log(f"Unexpected Exception!")
-		log(repr(e))
-		cur.close()
-		con.close()
-		exit(1)
+		raise e
 
 
-def export_table_to_csv(con, table_name):
+def export_table_to_csv(con, table_name: str, max_cols: int = 1_000):
 	log(f"Reading entire table '{table_name}'")
 
+	table_columns = []
 	try:
-		query = f"""
-SELECT * FROM {table_name}
-		"""
-		(rows, columns) = execute_query(con, query)
-		df = pd.DataFrame(rows, columns=columns)
-		row_count = len(df)
-		log(f"Fetched {row_count} rows")
+		# Here we select what columns will be exported at what time
+		# See `export_table_to_csv_chunked()` for an explanation
+		(rows, _) = execute_query(con, f"""
+SELECT RDB$FIELD_NAME
+FROM RDB$RELATION_FIELDS
+WHERE RDB$RELATION_NAME = '{table_name}'
+		""")
+		rows = [ row[0] for row in rows ]
+		column_count = len(rows)
+		log(f"Table has {column_count} column(s)")
 
-		# Guarantees /csv directory exists
-		file_path = f"/data/csv/{table_name}.csv"
-		os.makedirs(os.path.dirname(file_path), exist_ok=True)
-		df.to_csv(file_path, mode='w', header=True, index=False)
-		log(f"Saved to '{file_path}'")
+		if len(rows) > max_cols:
+			table_columns = split_array_chunks(rows, max_cols)
+		else:
+			table_columns = [ rows ]
 
+		for i, column_group in enumerate(table_columns):
+			log(f"Attempting to export {len(column_group)} column(s)")
+			select_columns = ",".join(column_group) if len(column_group) else "*"
+
+			query = f"""
+SELECT {select_columns} FROM {table_name}
+			"""
+			(rows, columns) = execute_query(con, query)
+			df = pd.DataFrame(rows, columns=columns)
+			row_count = len(df)
+			log(f"Fetched {row_count} rows")
+
+			specifier = "" if i == 0 else f"_cont{i}"
+			file_path = f"/data/csv/{table_name}{specifier}.csv"
+			# Guarantees /csv directory exists
+			os.makedirs(os.path.dirname(file_path), exist_ok=True)
+			df.to_csv(file_path, mode='w', header=True, index=False)
+			log(f"Saved to '{file_path}'")
+			return True
+
+	except firebirdsql.OperationalError as e:
+		log(f"OperationalError: {str(e)}; skipping table")
+		return False
+	# ConnectionResetError, BrokenPipeError, ...
 	except Exception as e:
-		log(f"Unexpected Exception!")
-		log(repr(e))
-		con.close()
-		exit(1)
+		log(f"{repr(e)}; skipping table")
+		return False
 
 
-def export_table_to_csv_chunked(con, table_name, chunk_size, cont=0):
+def export_table_to_csv_chunked(con, table_name: str, chunk_size: int, cont: int = 0, max_cols: int = 1_000):
 	log(f"Reading table '{table_name}' in chunks of {chunk_size} rows")
-
-	cont = int(cont) or 0
+	cont = max(0, int(cont or 0))
 	offset = cont
-	first_write = True
 	table_size = None
-	while True:
+	table_columns = []
+	break_main_loop = False
+
+	# Here, we iterate through the table exporting lines in chunks of `chunk_size`
+	# In the first iteration, we attempt to fetch the table's list of columns and
+	# its row count. If there's too many columns, we'll split the export into
+	# multiple CSVs, otherwise Firebird explodes sometimes
+	main_loop_it = -1
+	while not break_main_loop:
+		main_loop_it += 1
 		try:
-			if first_write:
+			if main_loop_it == 0:
+				# Sometimes we get 'OperationalError("Can not recv() packets")'
+				# It seems as if that happens when the table has over ~45 columns
+				# So, here, we first check how many columns the table has
+				(rows, _) = execute_query(con, f"""
+SELECT RDB$FIELD_NAME
+FROM RDB$RELATION_FIELDS
+WHERE RDB$RELATION_NAME = '{table_name}'
+				""")
+				# `rows` here is [  ( col name, ), ( col name, ), ...  ]
+				rows = [ row[0] for row in rows ]  # becomes [ col name, col name, ... ]
+				column_count = len(rows)
+				log(f"Table has {column_count} column(s)")
+
+				# If we're over the maximum column count
+				if len(rows) > max_cols:
+					# Split columns into groups of at most limit size
+					table_columns = split_array_chunks(rows, max_cols)
+				else:
+					# Otherwise, pick all columns
+					table_columns = [ rows ]
+
+				# Get table row count
 				(rows, _) = execute_query(con, f"""
 SELECT COUNT(*) FROM {table_name}
 				""")
@@ -124,58 +182,67 @@ SELECT COUNT(*) FROM {table_name}
 				table_size = rows[0][0]
 				log(f"Table has {table_size} row(s)")
 
-			# Get chunked results via FIRST N SKIP M syntax using RDB$DB_KEY as a
-			# unique representation of each table record
-			# [Ref FIRST/SKIP] https://www.firebirdsql.org/refdocs/langrefupd20-select.html#langrefupd20-first-skip
-			# [Ref RDB$DB_KEY] https://www.ibphoenix.com/articles/art-00000384
-			query = f"""
-SELECT FIRST {chunk_size} SKIP {offset} *
-FROM {table_name}
-ORDER BY RDB$DB_KEY
-			"""
-			(rows, columns) = execute_query(con, query)
+			# Do selective fetching of columns respecting the limit
+			# If there's less than the limit, this loop runs only once
+			for i, column_group in enumerate(table_columns):
+				log(f"Attempting to export {len(column_group)} column(s)")
+				select_columns = ",".join(column_group) if len(column_group) else "*"
 
-			# We could manually write the CSV but we can just use Pandas instead
-			df = pd.DataFrame(rows, columns=columns)
-			row_count = len(df)
-			total_so_far = row_count + offset
-			if table_size:
-				pct = round((total_so_far/table_size)*100_00)/1_00
-				log(f"Fetched {row_count} rows -- ({pct}%) {total_so_far} read of {table_size} total")
-			else:
-				log(f"Fetched {row_count} rows -- {total_so_far} read")
+				# Get chunked results via FIRST N SKIP M syntax using RDB$DB_KEY as a
+				# unique representation of each table record
+				# [Ref FIRST/SKIP] https://www.firebirdsql.org/refdocs/langrefupd20-select.html#langrefupd20-first-skip
+				# [Ref RDB$DB_KEY] https://www.ibphoenix.com/articles/art-00000384
+				query = f"""
+	SELECT FIRST {chunk_size} SKIP {offset} {select_columns}
+	FROM {table_name}
+	ORDER BY RDB$DB_KEY
+				"""
+				(rows, columns) = execute_query(con, query)
 
-			# If we've already created the file previously
-			if first_write and cont > 0:
-				first_write = False
-			file_path = f"/data/csv/{table_name}.csv"
-			if first_write:
-				# Guarantees /csv directory exists
-				os.makedirs(os.path.dirname(file_path), exist_ok=True)
-				df.to_csv(file_path, mode='w', header=True, index=False)
-				first_write = False
-				log(f"Saved to '{file_path}'")
-			else:
-				df.to_csv(file_path, mode='a', header=False, index=False)
-				log(f"Appended to '{file_path}'")
+				# We could manually write the CSV but we can just use Pandas instead
+				df = pd.DataFrame(rows, columns=columns)
+				row_count = len(df)
+				total_so_far = row_count + offset
+				if table_size:
+					pct = round((total_so_far/table_size)*100_00)/1_00
+					log(f"Fetched {row_count} rows -- ({pct}%) {total_so_far} read of {table_size} total")
+				else:
+					log(f"Fetched {row_count} rows -- {total_so_far} read")
 
-			# If we fetched no rows (empty table, row count is exact multiple
-			# of chunk_size, ...), we're done
-			if row_count <= 0:
-				log("Fetched no rows; assuming end of table")
-				break
-			# If the number of rows fetched is less than chunk_size, we're done
-			if row_count < chunk_size:
-				log(f"Fetched fewer rows than `chunk_size` ({chunk_size}); assuming end of table")
-				break
+				specifier = "" if i == 0 else f"_cont{i}"
+				file_path = f"/data/csv/{table_name}{specifier}.csv"
+				# Create file if it's the first iteration and we're not
+				# continuing from a previous export
+				if main_loop_it == 0 and cont == 0:
+					# Guarantees /csv directory exists
+					os.makedirs(os.path.dirname(file_path), exist_ok=True)
+					df.to_csv(file_path, mode='w', header=True, index=False)
+					log(f"Saved to '{file_path}'")
+				else:
+					df.to_csv(file_path, mode='a', header=False, index=False)
+					log(f"Appended to '{file_path}'")
+
+				# If we fetched no rows (empty table, row count is exact multiple
+				# of chunk_size, ...), we're done
+				if row_count <= 0:
+					log("Fetched no rows; assuming end of table")
+					break_main_loop = True
+				# If the number of rows fetched is less than chunk_size, we're done
+				if row_count < chunk_size:
+					log(f"Fetched fewer rows than `chunk_size` ({chunk_size}); assuming end of table")
+					break_main_loop = True
+			# /for column_group in table_columns
+
 			# Increment offset for the next chunk
 			offset += chunk_size
 
+		except firebirdsql.OperationalError as e:
+			log(f"OperationalError: {str(e)}; skipping table")
+			return False
 		except Exception as e:
-			log(f"Unexpected Exception!")
-			log(repr(e))
-			con.close()
-			exit(1)
+			log(f"{repr(e)}; skipping table")
+			return False
+	return True
 
 
 ################################################################################
@@ -185,7 +252,7 @@ def main():
 	PATH = os.environ.get("FB_GDB_PATH")
 	if not os.path.isfile(PATH):
 		log(f"FB_GDB_PATH='{PATH}' is not a file!")
-		exit(1)
+		raise ValueError(f"FB_GDB_PATH='{PATH}' is not a file!")
 
 	USER = os.environ.get("FB_USER", "SYSDBA")
 	PASS = os.environ.get("FB_PASSWORD", "masterkey")
@@ -198,11 +265,11 @@ def main():
 	NO_CHUNKS = os.environ.get("NO_CHUNKS") is not None
 	CONTINUE = int(os.environ.get("CONTINUE", 0))
 
+	CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", 10_000))
+	MAX_COLUMNS_PER_QUERY = int(os.environ.get("MAX_COLUMNS", 1_000))
+
 	# Attempts connection
 	con = get_connection(PATH, user=USER, password=PASS, charset=CHAR)
-
-	# Get metadata -- every column from every table
-	export_table_to_csv(con, "RDB$RELATION_FIELDS")
 
 	# Gets all available tables in the Database
 	# [Ref] https://ib-aid.com/download/docs/firebird-language-reference-2.5/fblangref-appx04-relations.html
@@ -237,27 +304,48 @@ ORDER BY RDB$RELATION_NAME
 
 	log(f"Found {len(tables_that_exist)} requested tables (out of {len(wanted_tables)} requested, {len(found_tables)} total)\n")
 
-	CHUNK_SIZE = 10_000
+	log("Clearing contents of /data/csv")
+	shutil.rmtree("/data/csv", ignore_errors=True)
+
+	# Get metadata -- every column from every table
+	export_table_to_csv(con, "RDB$RELATION_FIELDS", max_cols=MAX_COLUMNS_PER_QUERY)
+
+	status = True
+	failed_tables = []
 	# For every table that exists
 	for i, table in enumerate(tables_that_exist):
 		log(f"Reading table {i+1}/{len(tables_that_exist)}")
 
 		# If user doesn't want chunks, we just try exporting the entire table
 		if NO_CHUNKS:
-			export_table_to_csv(con, table)
+			status = export_table_to_csv(con, table, max_cols=MAX_COLUMNS_PER_QUERY)
 		# Otherwise, we do the more labor-intensive process of chunking the results
 		else:
 			# For the first table, we might want to continue a previous extraction
 			if i == 0:
 				if CONTINUE > 0:
 					log(f"Continuing previous extraction; skipping {CONTINUE} rows")
-				export_table_to_csv_chunked(con, table, CHUNK_SIZE, cont=CONTINUE)
+				status = export_table_to_csv_chunked(con, table, CHUNK_SIZE, cont=CONTINUE, max_cols=MAX_COLUMNS_PER_QUERY)
 			# For the rest of them, start from scratch
 			else:
-				export_table_to_csv_chunked(con, table, CHUNK_SIZE)
+				status = export_table_to_csv_chunked(con, table, CHUNK_SIZE, max_cols=MAX_COLUMNS_PER_QUERY)
 
+		# If Firebird crashed during export
+		if not status:
+			# Mark table as failed
+			failed_tables.append(table)
+			# Open new connection
+			con = get_connection(PATH, user=USER, password=PASS, charset=CHAR)
 		log(f"Done with {table}!\n")
 		log("-"*10)
+
+	if len(failed_tables) > 0:
+		log("Some tables were not exported. Saving names to _FAILED_TABLES.csv")
+		file_path = f"/data/csv/_FAILED_TABLES.csv"
+		# Guarantees /csv directory exists
+		os.makedirs(os.path.dirname(file_path), exist_ok=True)
+		df = pd.DataFrame.from_dict({ "failed_table": failed_tables })
+		df.to_csv(file_path, mode='w', header=True, index=False)
 
 	con.close()
 	return
